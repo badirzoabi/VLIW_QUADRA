@@ -41,7 +41,33 @@ A generic R/W port is a standard, available building block (FPGA true dual-port 
 
 **Decision:** 2 generic R/W memory ports, each independently configurable per cycle as a load or a store. Same-address read/write collision behavior (read-first vs. write-first) to be fixed as an explicit spec convention before RTL.
 
+## 3. Pipeline Forwarding & Latency Table
+
+**No dynamic hazard detection unit.** QUADRA's hardware never stalls or inserts a bubble on its own — correctness comes entirely from the packer's static schedule, which is guaranteed to never read a register before its producer's result actually exists. A dynamic hazard-detection-and-stall unit would reintroduce exactly the runtime complexity VLIW is designed to move into software, so it is explicitly excluded.
+
+**Forwarding paths (static bypass muxes, not decision logic):**
+- `MEM → EX` — forwards an ALU result sitting in the EX/MEM pipeline register to the EX stage of the very next bundle. Covers back-to-back ALU dependencies with zero gap.
+- `WB → EX` — forwards a result sitting in the MEM/WB pipeline register to the EX stage of a bundle two cycles behind. Covers dependencies 2 bundles apart.
+- `WB → D` — bypasses the register file read in Decode when a producer's write-back lands in the same cycle as a consumer's register read, avoiding a stale read.
+
+These are always-on muxes that pick the freshest available value; they involve no runtime comparison-and-stall decision, so they don't violate the no-dynamic-hazard-detection rule.
+
+**Why the load-use case is different:** an ALU result exists at the end of EX, so `MEM → EX` forwarding delivers it to the very next bundle with no gap. A load's result doesn't exist until the end of its own MEM stage (the data memory read itself takes the full cycle) — which lands at the same time the next bundle is in EX. No forwarding path can deliver a value before it's produced, so a load's result is only available starting 2 cycles after issue, same as a classic scalar RISC-V pipeline's load-use hazard — the difference is that here it's resolved statically by the packer's latency table, not by a runtime-inserted stall.
+
+**Latency table (cycles until a result is safely readable by a dependent instruction):**
+
+| Op | Latency (cycles) | Forwarding path that covers it |
+|---|---|---|
+| ALU (ADD/SUB/AND/OR/...) | 1 | `MEM → EX` |
+| MUL | 2 | `WB → EX` |
+| LOAD | 2 | `WB → EX` |
+| STORE | 1 (no destination register) | n/a |
+| BRANCH | 1 (condition folded into ALU1, no separate latency) | `MEM → EX` |
+
+This table is the single source of truth both the RTL forwarding network and the Python packer's dependency scheduler must agree on exactly — any mismatch here produces silently wrong results rather than a crash.
+
 ## Final Decision
 
 **Register file: 6 read ports / 3 write ports, monolithic flip-flop array.**
 **Data memory: 2 generic read/write ports, standard dual-port SRAM/BRAM style.**
+**Hazards: no dynamic detection/stall unit; static `MEM→EX`, `WB→EX`, `WB→D` forwarding plus a fixed per-op latency table enforced entirely by the packer.**
