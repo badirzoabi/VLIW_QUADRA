@@ -4,14 +4,13 @@ Running log of architectural decisions for QUADRA, with the reasoning behind eac
 
 ## 1. Register File Ports
 
-**Bundle layout:** 2 ALU + 1 MEM + 1 BRANCH. Branch condition is folded into ALU1's compare, so BRANCH adds no independent register reads.
+**Bundle layout:** 2 ALU + 2 generic MEM + 1 BRANCH (5 slots — see Section 2). Branch condition is *usually* folded into ALU1's compare, but not always (see caveat below), so BRANCH can occasionally need its own independent reads.
 
-**Worst-case port requirement:** 6 read ports, 3 write ports.
-- ALU0: 2R / 1W
-- ALU1: 2R / 1W
-- MEM: up to 2R (store = base + data), up to 1W (load)
+**Worst-case write-port requirement: 4 write ports, not 3.** The old 6R/3W figure predates the move to 2 generic MEM ports (Section 2) and was never re-derived — it assumed only one memory slot could ever write. Corroborated by a general architectural rule, not just our own example: [Penn CIS 501 (Martin), "Superscalar Register Read/Write," slide 23](https://acg.cis.upenn.edu/milom/cis501-Fall10/lectures/07_superscalar.pdf) — *"Nominally, 2N read + N write... in reality, fewer than that: write ports — stores, branches don't write registers."* Applied here: STORE and BRANCH never write, so the only possible writers are ALU0, ALU1, and MEM0/MEM1 *when each is a load* → **4 simultaneous writers, achievable any cycle both MEM ports are loads** (confirmed directly in our own software-pipelined vector-add kernel, Section 5 — row 0 of the steady state needs exactly this: 2 ALU results + 2 loads, every other cycle, by construction).
 
-**Typical-case estimate:** using a classic RISC instruction mix (~46% ALU, ~35% load/store, ~17% branch) combined with typical VLIW bundle fill rates (~2.3 of 4 slots used), expected usage is closer to **4 reads / 2 writes** per bundle. The hardware must still be built for the 6R3W worst case, since port count is a static resource, not an average one.
+**Read-port requirement: budget for 8, with an open caveat.** Worst case by slot: ALU0/ALU1 up to 2R each (register-register op), MEM0/MEM1 up to 2R each (store = base + data) → 8R if BRANCH's compare always rides free on ALU1 (0R). **Caveat:** our own kernel trace showed a cycle where ALU1 is busy with unrelated work, so BRANCH can't always fold for free — if it needs its own independent 2-register compare in the same cycle both MEM ports are stores and both ALUs are 2-reg ops, the true worst case is **10R**, not 8. Not yet resolved whether the packer can reliably avoid this (e.g., always schedule the branch compare onto whichever ALU computes it) or whether 10R should be the real target — see Open Implementation Questions.
+
+**Typical-case estimate:** real usage is far below either worst case most of the time — walking our own kernel shows the only non-forwarded, "real" register-file read in steady state is the loop bound (read once every 2 cycles), because `MEM→EX`/`WB→EX` forwarding covers nearly every other operand. But ports are a static resource (the read fires every cycle regardless of whether forwarding overrides it, and reducing this would require exactly the dynamic hazard logic Section 3 rules out), so the hardware must still be built for the worst case, not the average.
 
 **Options considered:**
 | Option | Notes |
@@ -21,13 +20,13 @@ Running log of architectural decisions for QUADRA, with the reasoning behind eac
 | Banking (register-range split) | Cheaper, but risks data-dependent bank conflicts the packer must avoid |
 | Replicated RF (N copies, 1 read port each, shared write) | Pure hardware swap, no ISA/packer change — clean area/timing experiment, but write power scales with copy count |
 
-**Decision:** Build a monolithic 6-read / 3-write register file (flip-flop array, combinational read, synchronous write). Enforce `x0` hardwired to zero and add a same-cycle write-conflict assertion. A replicated-RF swap is a candidate later experiment for isolated area/timing comparison.
+**Decision:** Build a monolithic 8-read / 4-write register file (flip-flop array, combinational read, synchronous write). Enforce `x0` hardwired to zero and add a same-cycle write-conflict assertion. A replicated-RF swap is a candidate later experiment for isolated area/timing comparison.
 
 ## 2. Memory Ports
 
-**Baseline:** 1 MEM slot → single-port memory, no port-sharing problem.
-
 **Instruction-mix data used:** load ≈ 26%, store ≈ 9%, other ≈ 65% (classic RISC integer-benchmark mix).
+
+**Real-world precedent for favoring load bandwidth:** [Penn CIS 501 (Martin), "Superscalar Memory Access," slide 20](https://acg.cis.upenn.edu/milom/cis501-Fall10/lectures/07_superscalar.pdf) — multi-load/store bandwidth is "probably only necessary on processors 4-wide or wider"; Core i7 does 1 load + 1 store/cycle, Alpha 21164 does 2 loads *or* 1 store/cycle. Both favor load bandwidth over store bandwidth, matching the coverage math below.
 
 **Coverage of a random 4-instruction group, by memory-port design:**
 | Design | Ports | Coverage |
@@ -76,7 +75,7 @@ This table is the single source of truth both the RTL forwarding network and the
 
 **At most one branch per bundle** — already guaranteed structurally (only 1 BR slot exists), enforced additionally as a packer assertion.
 
-**JAL (calls):** scheduled alone in its own bundle (not packed with the destination function's entry — that would require interprocedural scheduling and risks code duplication; deferred as a stretch goal, not baseline). JAL's return-address write reuses **ALU1's existing write port** (the same port already shared with the branch-condition fold) — no new register-file write port needed, so the 6R/3W budget still holds.
+**JAL (calls):** scheduled alone in its own bundle (not packed with the destination function's entry — that would require interprocedural scheduling and risks code duplication; deferred as a stretch goal, not baseline). JAL's return-address write reuses **ALU1's existing write port** — no new register-file write port needed, so it stays within the 4-write budget (Section 1).
 
 **Branch prediction: backward branches predict taken.** A static, zero-hardware-cost rule (compare target address to branch address at decode — no history, no dynamic predictor). This matters specifically for software-pipelined loops (Section 5): a loop-closing branch is "taken" on every pass except the last, so without this rule the flush policy above would squash 2 bundles on nearly every iteration. With it, the flush penalty is paid once, on loop exit, instead of every pass.
 
@@ -99,12 +98,13 @@ This table is the single source of truth both the RTL forwarding network and the
 - Exact priority/offset-search heuristic for placing operations into kernel rows when multiple valid assignments exist (textbook modulo scheduling uses iterative backtracking, increasing MII if no valid placement is found).
 - How basic-block boundaries and non-loop (straight-line) code fall back to plain list scheduling when there's no loop to pipeline.
 - Register renaming scope: software pipelining has the same register-pressure concern as unrolling, scaled to however many iterations are in flight at once (here, 2).
+- **Branch-fold guarantee (new):** Section 1's write-port fix assumed BRANCH's compare always rides free on ALU1, but our own kernel has a cycle where ALU1 is busy with unrelated work. Either the packer must guarantee it always schedules *something* computing the branch condition onto ALU1 in the branch's cycle, or the register file needs 10 read ports instead of 8. Not yet resolved.
 
 ## Final Decision
 
-**Register file: 6 read ports / 3 write ports, monolithic flip-flop array.**
+**Register file: 8 read ports / 4 write ports, monolithic flip-flop array (read count has an open 10R caveat — see Section 1).**
 **Data memory: 2 generic read/write ports, standard dual-port SRAM/BRAM style.**
 **Hazards: no dynamic detection/stall unit; static `MEM→EX`, `WB→EX`, `WB→D` forwarding plus a fixed per-op latency table enforced entirely by the packer.**
 **Branches: flush-based (2-bundle squash on taken), backward branches predicted taken.**
 **Packer: software pipelining (modulo scheduling) as the core scheduling algorithm, not plain list scheduling or unrolling.**
-**ALU count: 2, not 3 — for our loop-dominated test programs, MEM ties ALU as the resource bottleneck at the same MII, so a 3rd ALU would not improve throughput while still costing a jump to 8R4W register-file ports.**
+**ALU count: 2, not 3 — for our loop-dominated test programs, MEM ties ALU as the resource bottleneck at the same MII, so a 3rd ALU would not improve throughput while adding even more register-file port pressure on top of the 8R/4W this design already requires.**
