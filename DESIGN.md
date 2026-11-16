@@ -59,12 +59,24 @@ These are always-on muxes that pick the freshest available value; they involve n
 | Op | Latency (cycles) | Forwarding path that covers it |
 |---|---|---|
 | ALU (ADD/SUB/AND/OR/...) | 1 | `MEM → EX` |
-| MUL | 2 | `WB → EX` |
+| MUL | 1 (fully combinational multiplier in EX) | `MEM → EX` |
 | LOAD | 2 | `WB → EX` |
 | STORE | 1 (no destination register) | n/a |
 | BRANCH | 1 (condition folded into ALU1, no separate latency) | `MEM → EX` |
 
 This table is the single source of truth both the RTL forwarding network and the Python packer's dependency scheduler must agree on exactly — any mismatch here produces silently wrong results rather than a crash.
+
+**Open question:** does the multiplier live in both ALU slots or only one? Replicating a full 32×32 combinational multiplier in both ALUs roughly doubles that block's area; putting it in only one ALU adds a resource constraint the packer must enforce (MUL restricted to a specific ALU slot), similar to the single-MEM-slot rule. Not yet decided.
+
+**Known tradeoff accepted:** a 1-cycle multiplier's delay becomes part of the core's critical path and may set the maximum clock frequency for the whole design, not just MUL instructions. To be confirmed once synthesis timing is available.
+
+## 4. Branch Handling & Control Flow
+
+**Branch resolution: flush, not delay slots.** The branch condition resolves at the end of EX (it rides on ALU1's compare result). Since fetch runs 2 stages ahead of EX, a taken branch unconditionally squashes the 2 bundles already fetched behind it — a fixed, deterministic flush triggered directly by the branch-taken signal, not a dynamic hazard decision. The packer does not need to prove anything safe about what follows a branch; squashed bundles are simply discarded.
+
+**At most one branch per bundle** — already guaranteed structurally (only 1 BR slot exists), enforced additionally as a packer assertion.
+
+**JAL (calls):** scheduled alone in its own bundle (not packed with the destination function's entry — that would require interprocedural scheduling and risks code duplication; deferred as a stretch goal, not baseline). JAL's return-address write reuses **ALU1's existing write port** (the same port already shared with the branch-condition fold) — no new register-file write port needed, so the 6R/3W budget still holds.
 
 ## Final Decision
 
