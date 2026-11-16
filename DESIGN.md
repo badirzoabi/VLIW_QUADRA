@@ -78,8 +78,33 @@ This table is the single source of truth both the RTL forwarding network and the
 
 **JAL (calls):** scheduled alone in its own bundle (not packed with the destination function's entry — that would require interprocedural scheduling and risks code duplication; deferred as a stretch goal, not baseline). JAL's return-address write reuses **ALU1's existing write port** (the same port already shared with the branch-condition fold) — no new register-file write port needed, so the 6R/3W budget still holds.
 
+**Branch prediction: backward branches predict taken.** A static, zero-hardware-cost rule (compare target address to branch address at decode — no history, no dynamic predictor). This matters specifically for software-pipelined loops (Section 5): a loop-closing branch is "taken" on every pass except the last, so without this rule the flush policy above would squash 2 bundles on nearly every iteration. With it, the flush penalty is paid once, on loop exit, instead of every pass.
+
+## 5. Packer Scheduling Algorithm — Software Pipelining (Tier 4)
+
+**Decision: the packer uses modulo scheduling (software pipelining), not plain in-order or basic-block-only list scheduling.** Our test programs (vector add, dot product, FIR, matmul) are loop-dominated, and a single loop iteration's own instruction-level parallelism is too small to use the 4-wide machine well — real utilization comes from overlapping multiple iterations, which this technique does without the code-size cost of unrolling.
+
+**Method:**
+1. Compute the **Minimum Initiation Interval (MII)** = `max(resource-bound, recurrence-bound)`.
+   - Resource-bound = `max` over each resource of `ceil(ops needing that resource per iteration / ports for that resource)`.
+   - Recurrence-bound = `max` over each loop-carried dependency cycle of `ceil(latency / distance)`.
+2. Find a conflict-free steady-state **kernel** of `MII` cycles, assigning each operation a fixed row (cycle mod MII) such that all latency and resource constraints hold for every iteration, overlapped.
+3. Generate a **prologue** (fills the pipeline before the kernel can validly repeat) and an **epilogue** (drains the last iterations' in-flight work after the final new iteration enters).
+
+**Worked example (vector add, 4 iterations):** ALU ops/iter = 4 (C,E,F,G), MEM ops/iter = 3 (A,B,D), BR ops/iter = 1 → resource-bound MII = `max(ceil(4/2), ceil(3/2), ceil(1/1))` = **2**. Recurrence-bound (E,F self-increment) = 1. **MII = 2 cycles/iteration.** Full 4-iteration trace: 2 prologue cycles + 6 steady-state cycles + 2 epilogue cycles = 10 cycles total (≈2.5 cycles/iteration for N=4, converging toward 2.0 as N grows). See chat history for the full cycle-by-cycle kernel table.
+
+**Explicitly excluded:** trace scheduling (speculating past branches) — conflicts with the flush-based branch model in Section 4.
+
+**Open implementation questions:**
+- Exact priority/offset-search heuristic for placing operations into kernel rows when multiple valid assignments exist (textbook modulo scheduling uses iterative backtracking, increasing MII if no valid placement is found).
+- How basic-block boundaries and non-loop (straight-line) code fall back to plain list scheduling when there's no loop to pipeline.
+- Register renaming scope: software pipelining has the same register-pressure concern as unrolling, scaled to however many iterations are in flight at once (here, 2).
+
 ## Final Decision
 
 **Register file: 6 read ports / 3 write ports, monolithic flip-flop array.**
 **Data memory: 2 generic read/write ports, standard dual-port SRAM/BRAM style.**
 **Hazards: no dynamic detection/stall unit; static `MEM→EX`, `WB→EX`, `WB→D` forwarding plus a fixed per-op latency table enforced entirely by the packer.**
+**Branches: flush-based (2-bundle squash on taken), backward branches predicted taken.**
+**Packer: software pipelining (modulo scheduling) as the core scheduling algorithm, not plain list scheduling or unrolling.**
+**ALU count: 2, not 3 — for our loop-dominated test programs, MEM ties ALU as the resource bottleneck at the same MII, so a 3rd ALU would not improve throughput while still costing a jump to 8R4W register-file ports.**
